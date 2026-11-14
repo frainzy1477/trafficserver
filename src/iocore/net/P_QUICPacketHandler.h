@@ -1,0 +1,132 @@
+/** @file
+
+  A brief file description
+
+  @par License
+
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+ */
+
+#pragma once
+
+#include "P_NetAccept.h"
+#include "P_QUICClosedConCollector.h"
+#include "iocore/net/UDPConnection.h"
+#include "tscore/ink_config.h"
+
+#if TS_HAS_OPENSSL_QUIC
+#include <openssl/ssl.h>
+#elif TS_HAS_QUICHE
+#include <quiche.h>
+#endif
+
+class QUICNetVConnection;
+class QUICConnectionTable;
+
+class QUICPacketHandler
+{
+public:
+  QUICPacketHandler();
+  virtual ~QUICPacketHandler();
+
+  void send_packet(UDPConnection *udp_con, IpEndpoint &addr, Ptr<IOBufferBlock> udp_payload, uint16_t segment_size = 0,
+                   struct timespec *send_at_hint = nullptr);
+  void close_connection(QUICNetVConnection *conn);
+
+protected:
+  Event                                  *_collector_event      = nullptr;
+  std::unique_ptr<QUICClosedConCollector> _closed_con_collector = nullptr;
+
+  virtual Continuation *_get_continuation() = 0;
+
+  virtual void _recv_packet(int event, UDPPacket *udpPacket) = 0;
+};
+
+class QUICPacketHandlerIn : public NetAccept, public QUICPacketHandler
+{
+public:
+#if TS_HAS_OPENSSL_QUIC
+  QUICPacketHandlerIn(NetProcessor::AcceptOptions const &opt);
+#elif TS_HAS_QUICHE
+  QUICPacketHandlerIn(NetProcessor::AcceptOptions const &opt, QUICConnectionTable &ctable, quiche_config &config);
+#endif
+  ~QUICPacketHandlerIn();
+
+  // NetAccept
+  NetProcessor *getNetProcessor() const override;
+  NetAccept    *clone() const override;
+  int           acceptEvent(int event, void *e) override;
+  void          init_accept(EThread *t) override;
+
+#if TS_HAS_OPENSSL_QUIC
+  /** Accepts on net threads 0..k-1, up to the first whose listener fails, each with its own copy of this acceptor, UDP
+   * socket and OpenSSL listener.
+   *
+   * On Linux and FreeBSD the sockets share the port, and the kernel spreads incoming datagrams over them by a hash of
+   * the addresses and ports. Elsewhere, or when the first socket cannot share the port, one listener serves the port.
+   */
+  void init_accept_per_thread_listeners();
+#endif
+
+protected:
+  // QUICPacketHandler
+  Continuation *_get_continuation() override;
+
+private:
+  /// How _start_listener() went; port_not_shared means the socket could not share the port with other net threads.
+  enum class Listen { started, port_not_shared, failed };
+
+#if TS_HAS_OPENSSL_QUIC
+  SSL   *_listener = nullptr;
+  Event *_event    = nullptr;
+#elif TS_HAS_QUICHE
+  QUICConnectionTable &_ctable;
+  quiche_config       &_quiche_config;
+#endif
+
+  void _recv_packet(int event, UDPPacket *udpPacket) override;
+
+#if TS_HAS_OPENSSL_QUIC
+  /** Opens the socket unless there is one, and starts the OpenSSL listener on it.
+   *
+   * @param [in] net_thread Index of the net thread this listener is for when each net thread has one, which makes the
+   *        socket share the port; -1 for a port's only listener.
+   */
+  Listen _start_listener(int net_thread = -1);
+  /// Logs that the port has no listener, closes its socket and frees its OpenSSL listener.
+  void _stop_unstarted_listener();
+  void _schedule_on(EThread *t);
+  void _service_listener();
+  void _schedule_event();
+#endif
+};
+
+class QUICPacketHandlerOut : public Continuation, public QUICPacketHandler
+{
+public:
+  QUICPacketHandlerOut(){};
+  ~QUICPacketHandlerOut(){};
+
+  void init(QUICNetVConnection *vc);
+
+protected:
+  // QUICPacketHandler
+  Continuation *_get_continuation() override;
+
+private:
+  void _recv_packet(int event, UDPPacket *udp_packet) override;
+};

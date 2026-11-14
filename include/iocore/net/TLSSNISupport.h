@@ -1,0 +1,231 @@
+/** @file
+
+  TLSSNISupport implements common methods and members to
+  support protocols for Server Name Indication
+
+  @par License
+
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+ */
+#pragma once
+
+#include "tscore/ink_config.h"
+#include "tscore/ink_memory.h"
+#include "SSLTypes.h"
+
+#include <netinet/in.h>
+#include <openssl/ssl.h>
+
+#include <array>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <memory>
+#include <optional>
+
+class TLSSNISupport
+{
+public:
+  class ClientHello
+  {
+  public:
+    ClientHello(ClientHelloContainer chc) : _chc(chc) {}
+    ~ClientHello();
+
+    class ExtensionIdIterator
+    {
+    public:
+#if HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+      ExtensionIdIterator(int *ids, size_t len, size_t offset) : _extensions(ids), _ext_len(len), _offset(offset) {}
+#elif HAVE_SSL_CTX_SET_SELECT_CERTIFICATE_CB
+      ExtensionIdIterator(const uint8_t *extensions, size_t len, size_t offset)
+        : _extensions(extensions), _ext_len(len), _offset(offset)
+      {
+      }
+#endif
+      ~ExtensionIdIterator() = default;
+
+      ExtensionIdIterator &operator++();
+      bool                 operator==(const ExtensionIdIterator &b) const;
+      int                  operator*() const;
+
+    private:
+#if HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+      int *_extensions;
+#elif HAVE_SSL_CTX_SET_SELECT_CERTIFICATE_CB
+      const uint8_t *_extensions;
+#endif
+      size_t _ext_len = 0;
+      size_t _offset  = 0;
+    };
+
+    uint16_t         getVersion();
+    std::string_view getCipherSuites();
+    /** Iterate every extension type in the ClientHello in wire order.
+     *
+     * This includes GREASE values and extension types the TLS library does
+     * not recognize. OpenSSL omits those from its parsed ClientHello, so on
+     * OpenSSL this walks the extension types recorded from the raw
+     * ClientHello message, falling back to OpenSSL's parsed list if the raw
+     * message could not be parsed.
+     */
+    ExtensionIdIterator begin();
+    ExtensionIdIterator end();
+
+    /**
+     * @return 1 if successful
+     */
+    int getExtension(int type, const uint8_t **out, size_t *outlen);
+
+    /** The host name in the server_name extension, or empty if the ClientHello has none or the extension does not parse.
+     *
+     * The view points into the ClientHello and is only valid during the ClientHello callback.
+     */
+    std::string_view getServerName();
+
+  private:
+    ClientHelloContainer _chc;
+#if HAVE_SSL_CTX_SET_CLIENT_HELLO_CB
+    int   *_ext_ids = nullptr;
+    size_t _ext_len{0};
+#endif
+  };
+
+  virtual ~TLSSNISupport() = default;
+
+  static void           initialize();
+  static TLSSNISupport *getInstance(SSL *ssl);
+  static void           bind(SSL *ssl, TLSSNISupport *snis);
+  static void           unbind(SSL *ssl);
+
+  int          perform_sni_action(SSL &ssl);
+  ClientHello *get_client_hello() const;
+  // Callback functions for OpenSSL libraries
+
+  /** Process a CLIENT_HELLO from a client.
+   *
+   * This is for client-side connections.
+   */
+  void on_client_hello(ClientHello &client_hello);
+
+  /** Forget the CLIENT_HELLO passed to on_client_hello(), which is only valid during the ClientHello callback.
+   */
+  void clear_client_hello();
+
+  /** Record the extension types of a raw ClientHello handshake message.
+   *
+   * @param[in] msg The full handshake message, including its four byte header.
+   * @param[in] len The length of @a msg in bytes.
+   */
+  void on_client_hello_message(const uint8_t *msg, size_t len);
+
+  /** Validate a raw ClientHello handshake message and count its extension types.
+   *
+   * The whole message is validated even when @a capacity is too small to hold
+   * every extension type, so a caller can size exact storage from the count
+   * and parse again.
+   *
+   * @param[in] msg The full handshake message, including its four byte header.
+   * @param[in] len The length of @a msg in bytes.
+   * @param[out] types Receives the first @a capacity extension types, in wire order. May be null if @a capacity is 0.
+   * @param[in] capacity The number of entries @a types can hold.
+   * @return The number of extensions in the ClientHello, or std::nullopt if
+   *   @a msg is not a well formed ClientHello.
+   */
+  static std::optional<size_t> parse_client_hello_extension_types(const uint8_t *msg, size_t len, int *types, size_t capacity);
+
+  /** Process the servername extension when a client uses one in the TLS handshake.
+   *
+   * This is for client-side connections.
+   */
+  void on_servername(SSL *ssl, int *al, void *arg);
+
+  /** Set the servername extension for server-side connections.
+   *
+   * This is for server-side connections.
+   * This calls SSL_set_tlsext_host_name() to set the servername extension.
+   *
+   * @param ssl The SSL object upon which the servername extension is set.
+   * @param name The servername to set. This is assumed to be a non-empty,
+   *   null-terminated string.
+   * @return True if the servername was set successfully, false otherwise.
+   */
+  bool set_sni_server_name(SSL *ssl, char const *name);
+  void set_sni_server_name(std::string_view name);
+
+  /**
+   * Get the server name in SNI
+   *
+   * @return Either a pointer to the (null-terminated) name fetched from the TLS object or the empty string.
+   */
+  const char *get_sni_server_name() const;
+  bool        would_have_actions_for(const char *servername, IpEndpoint remote, int &enforcement_policy);
+
+  struct HintsFromSNI {
+    std::optional<uint32_t>    http2_buffer_water_mark;
+    std::optional<uint32_t>    server_max_early_data;
+    std::optional<uint32_t>    http2_initial_window_size_in;
+    std::optional<int32_t>     http2_max_settings_frames_per_minute;
+    std::optional<int32_t>     http2_max_ping_frames_per_minute;
+    std::optional<int32_t>     http2_max_priority_frames_per_minute;
+    std::optional<int32_t>     http2_max_rst_stream_frames_per_minute;
+    std::optional<int32_t>     http2_max_continuation_frames_per_minute;
+    std::optional<int32_t>     ssl_ticket_enabled;
+    std::optional<int32_t>     ssl_ticket_number;
+    std::optional<std::string> outbound_sni_policy;
+  } hints_from_sni;
+
+protected:
+  virtual in_port_t _get_local_port() = 0;
+
+  void _clear();
+
+  /** The extension types recorded from the raw ClientHello, in wire order.
+   *
+   * @param[out] count The number of recorded extension types.
+   * @return The recorded extension types, or nullptr if none are recorded.
+   */
+  const int *
+  _get_raw_extension_types(size_t &count) const
+  {
+    count = _raw_extension_count;
+    return _raw_extension_types;
+  }
+
+private:
+  static int _ex_data_index;
+
+  // Null-terminated string, or nullptr if there is no SNI server name.
+  std::unique_ptr<char[]> _sni_server_name;
+
+  void         _set_sni_server_name_buffer(std::string_view name);
+  ClientHello *_ch = nullptr;
+
+  void _reset_raw_extension_types();
+
+  // Extension types from the raw ClientHello, used where the TLS library's
+  // parsed ClientHello omits extensions it doesn't recognize. They are held in
+  // the fixed buffer unless the ClientHello has more extensions than it holds,
+  // so the common handshake does not allocate.
+  static constexpr size_t MAX_EXTENSIONS_FOR_FAST_PATH = 32;
+
+  // The recorded extension types, or nullptr if none have been recorded.
+  int                                          *_raw_extension_types = nullptr;
+  size_t                                        _raw_extension_count = 0;
+  std::array<int, MAX_EXTENSIONS_FOR_FAST_PATH> _fast_raw_extension_storage;
+  std::unique_ptr<int[]>                        _slow_raw_extension_storage;
+};

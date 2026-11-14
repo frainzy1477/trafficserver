@@ -15,15 +15,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """
-    TS Sphinx Directives
-    ~~~~~~~~~~~~~~~~~~~~~~~~~
+TS Sphinx Directives
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    Sphinx Docs directives for Apache Traffic Server
+Sphinx Docs directives for Apache Traffic Server
 
-    :copyright: Copyright 2013 by the Apache Software Foundation
-    :license: Apache
+:copyright: Copyright 2013 by the Apache Software Foundation
+:license: Apache
 """
 
 from docutils import nodes
@@ -37,6 +36,7 @@ import sphinx
 import os
 import subprocess
 import re
+import yaml
 
 # 2/3 compat logic
 try:
@@ -45,15 +45,27 @@ try:
     def is_string_type(s):
         return isinstance(s, basestring)
 except NameError:
+
     def is_string_type(s):
         return isinstance(s, str)
+
+
+def get_code(data):
+
+    # if needed we can add a type representer,
+    # def float_representer(dumper, value):
+    #     return dumper.represent_scalar(u'tag:yaml.org,2002:float', str(value), style="'")
+
+    # yaml.add_representer(float, float_representer)
+
+    return yaml.dump(data)
 
 
 class TSConfVar(std.Target):
     """
     Description of a traffic server configuration variable.
 
-    Argument is the variable as defined in records.config.
+    Argument is the variable as defined in records.yaml.
 
     Descriptive text should follow, indented.
 
@@ -67,11 +79,77 @@ class TSConfVar(std.Target):
         'deprecated': rst.directives.flag,
         'overridable': rst.directives.flag,
         'units': rst.directives.unchanged,
+        'legacy': rst.directives.flag,
     }
     required_arguments = 3
     optional_arguments = 1  # default is optional, special case if omitted
     final_argument_whitespace = True
     has_content = True
+
+    def __generate_code(self, cv_name, cv_default, cv_type):
+
+        def add_object(config, var, value, type=None):
+
+            def get_value(type, value):
+
+                def have_multipliers(value, mps):
+                    for m in mps:
+                        if value.endswith(m):
+                            return True
+
+                    return False
+
+                if value is None or value == 'nullptr' or value == 'NULL':
+                    return None
+
+                # We want to make the type right when inserting the element into the dict.
+                if type == 'FLOAT':
+                    return float(value)
+                elif type == 'INT':
+                    # We need to make it YAML compliant as this will be an int, so if contains
+                    # any special character like hex or a multiplier, then we make a string. ATS will
+                    # parse it as string anyway.
+                    if value.startswith('0x') or have_multipliers(value, ['K', 'M', 'G', 'T']):
+                        return str(value)
+                    else:
+                        return int(value)
+                elif type == 'STRING':
+                    return str(value)
+
+                return None
+
+            obj = {}
+            key = ''
+            index = var.find('.')
+            if index < 0:  # last part
+                config[var] = get_value(type, value)
+            else:
+                key = var[:index]
+                if key not in config:
+                    config[key] = {}
+
+                add_object(config[key], var[index + 1 :], value, type=type)
+
+        name = cv_name
+        if name.startswith("proxy.config."):
+            name = name[len("proxy.config.") :]
+        elif name.startswith("local.config."):
+            name = name[len("local.config.") :]
+
+        ts = {}
+        config = {}
+
+        # Build the object
+        add_object(config, name, cv_default, cv_type)
+        ts['records'] = config
+        code = get_code(ts)
+        literal = nodes.literal_block(code, code)
+        literal['linenos'] = True
+        literal['force'] = True
+        literal['language'] = 'yaml'
+        literal['caption'] = 'records.yaml'
+
+        return literal
 
     def make_field(self, tag, value):
         field = nodes.field()
@@ -89,7 +167,7 @@ class TSConfVar(std.Target):
         env = self.state.document.settings.env
         cv_default = None
         cv_scope, cv_name, cv_type = self.arguments[0:3]
-        if (len(self.arguments) > 3):
+        if len(self.arguments) > 3:
             cv_default = self.arguments[3]
 
         # First, make a generic desc() node to be the parent.
@@ -106,7 +184,7 @@ class TSConfVar(std.Target):
         title['first'] = False
         title['objtype'] = 'cv'
         self.add_name(title)
-        title.set_class('ts-cv-title')
+        title['classes'].append('ts-cv-title')
 
         # Finally, add a desc_name() node to display the name of the
         # configuration variable.
@@ -114,8 +192,8 @@ class TSConfVar(std.Target):
 
         node.append(title)
 
-        if ('class' in self.options):
-            title.set_class(self.options.get('class'))
+        if 'class' in self.options:
+            title['classes'].append(self.options.get('class'))
         # This has to be a distinct node before the title. if nested then
         # the browser will scroll forward to just past the title.
         nodes.target('', '', names=[cv_name])
@@ -127,18 +205,27 @@ class TSConfVar(std.Target):
         fl = nodes.field_list()
         fl.append(self.make_field('Scope', cv_scope))
         fl.append(self.make_field('Type', cv_type))
-        if (cv_default):
+        if cv_default:
             fl.append(self.make_field('Default', cv_default))
         else:
             fl.append(self.make_field('Default', sphinx.addnodes.literal_emphasis(text='*NONE*')))
-        if ('units' in self.options):
+        if 'units' in self.options:
             fl.append(self.make_field('Units', self.options['units']))
-        if ('reloadable' in self.options):
+        if 'reloadable' in self.options:
             fl.append(self.make_field('Reloadable', 'Yes'))
-        if ('overridable' in self.options):
+        if 'overridable' in self.options:
             fl.append(self.make_field('Overridable', 'Yes'))
-        if ('deprecated' in self.options):
+        if 'deprecated' in self.options:
             fl.append(self.make_field('Deprecated', 'Yes'))
+
+        # add yaml rep if record is not legacy.
+        code_block = None
+        code_block_title = None
+        if 'legacy' not in self.options:
+            code_block = self.__generate_code(cv_name, cv_default, cv_type)
+            code_block_title = sphinx.addnodes.compact_paragraph(text="yaml:")
+            self.add_name(code_block_title)
+            self.add_name(code_block)
 
         # Get any contained content
         nn = nodes.compound()
@@ -149,15 +236,13 @@ class TSConfVar(std.Target):
         # implicitly generated by the anchor node above.
         indexnode = sphinx.addnodes.index(entries=[])
         if sphinx.version_info >= (1, 4):
-            indexnode['entries'].append(
-                ('single', _('%s') % cv_name, nodes.make_id(cv_name), '', '')
-            )
+            indexnode['entries'].append(('single', _('%s') % cv_name, nodes.make_id(cv_name), '', ''))
         else:
-            indexnode['entries'].append(
-                ('single', _('%s') % cv_name, nodes.make_id(cv_name), '')
-            )
-
-        return [indexnode, node, fl, nn]
+            indexnode['entries'].append(('single', _('%s') % cv_name, nodes.make_id(cv_name), ''))
+        if code_block is None:
+            return [indexnode, node, fl, nn]
+        else:
+            return [indexnode, node, fl, code_block_title, code_block, nn]
 
 
 class TSConfVarRef(XRefRole):
@@ -172,17 +257,20 @@ def metrictypes(typename):
 def metricunits(unitname):
     return directives.choice(
         unitname.lower(),
-        ('ratio',
-         'percent',
-         'kbits',
-         'mbits',
-         'bytes',
-         'kbytes',
-         'mbytes',
-         'nanoseconds',
-         'microseconds',
-         'milliseconds',
-         'seconds'))
+        (
+            'ratio',
+            'percent',
+            'kbits',
+            'mbits',
+            'bytes',
+            'kbytes',
+            'mbytes',
+            'nanoseconds',
+            'microseconds',
+            'milliseconds',
+            'seconds',
+        ),
+    )
 
 
 class TSStat(std.Target):
@@ -205,7 +293,7 @@ class TSStat(std.Target):
         'units': metricunits,
         'introduced': rst.directives.unchanged,
         'deprecated': rst.directives.unchanged,
-        'ungathered': rst.directives.flag
+        'ungathered': rst.directives.flag,
     }
     required_arguments = 3
     optional_arguments = 1  # example value is optional
@@ -228,7 +316,7 @@ class TSStat(std.Target):
         env = self.state.document.settings.env
         stat_example = None
         stat_group, stat_name, stat_type = self.arguments[0:3]
-        if (len(self.arguments) > 3):
+        if len(self.arguments) > 3:
             stat_example = self.arguments[3]
 
         # First, make a generic desc() node to be the parent.
@@ -244,7 +332,7 @@ class TSStat(std.Target):
         title['first'] = False
         title['objtype'] = 'stat'
         self.add_name(title)
-        title.set_class('ts-stat-title')
+        title['classes'].append('ts-stat-title')
 
         # Finally, add a desc_name() node to display the name of the
         # configuration variable.
@@ -262,21 +350,21 @@ class TSStat(std.Target):
 
         fl = nodes.field_list()
         fl.append(self.make_field('Collection', stat_group))
-        if ('type' in self.options):
+        if 'type' in self.options:
             fl.append(self.make_field('Type', self.options['type']))
-        if ('units' in self.options):
+        if 'units' in self.options:
             fl.append(self.make_field('Units', self.options['units']))
         fl.append(self.make_field('Datatype', stat_type))
-        if ('introduced' in self.options and len(self.options['introduced']) > 0):
+        if 'introduced' in self.options and len(self.options['introduced']) > 0:
             fl.append(self.make_field('Introduced', self.options['introduced']))
-        if ('deprecated' in self.options):
-            if (len(self.options['deprecated']) > 0):
+        if 'deprecated' in self.options:
+            if len(self.options['deprecated']) > 0:
                 fl.append(self.make_field('Deprecated', self.options['deprecated']))
             else:
                 fl.append(self.make_field('Deprecated', 'Yes'))
-        if ('ungathered' in self.options):
+        if 'ungathered' in self.options:
             fl.append(self.make_field('Gathered', 'No'))
-        if (stat_example):
+        if stat_example:
             fl.append(self.make_field('Example', stat_example))
 
         # Get any contained content
@@ -289,13 +377,9 @@ class TSStat(std.Target):
         indexnode = sphinx.addnodes.index(entries=[])
 
         if sphinx.version_info >= (1, 4):
-            indexnode['entries'].append(
-                ('single', _('%s') % stat_name, nodes.make_id(stat_name), '', '')
-            )
+            indexnode['entries'].append(('single', _('%s') % stat_name, nodes.make_id(stat_name), '', ''))
         else:
-            indexnode['entries'].append(
-                ('single', _('%s') % stat_name, nodes.make_id(stat_name), '')
-            )
+            indexnode['entries'].append(('single', _('%s') % stat_name, nodes.make_id(stat_name), ''))
 
         return [indexnode, node, fl, nn]
 
@@ -314,29 +398,20 @@ class TrafficServerDomain(Domain):
     label = 'Traffic Server'
     data_version = 2
 
-    object_types = {
-        'cv': ObjType(_('configuration variable'), 'cv'),
-        'stat': ObjType(_('statistic'), 'stat')
-    }
+    object_types = {'cv': ObjType(_('configuration variable'), 'cv'), 'stat': ObjType(_('statistic'), 'stat')}
 
-    directives = {
-        'cv': TSConfVar,
-        'stat': TSStat
-    }
+    directives = {'cv': TSConfVar, 'stat': TSStat}
 
-    roles = {
-        'cv': TSConfVarRef(),
-        'stat': TSStatRef()
-    }
+    roles = {'cv': TSConfVarRef(), 'stat': TSStatRef()}
 
     initial_data = {
         'cv': {},  # full name -> docname
-        'stat': {}
+        'stat': {},
     }
 
     dangling_warnings = {
         'cv': "No definition found for configuration variable '%(target)s'",
-        'stat': "No definition found for statistic '%(target)s'"
+        'stat': "No definition found for statistic '%(target)s'",
     }
 
     def clear_doc(self, docname):
@@ -366,8 +441,8 @@ class TrafficServerDomain(Domain):
 
     def resolve_xref(self, env, src_doc, builder, obj_type, target, node, cont_node):
         dst_doc = self.find_doc(target, obj_type)
-        if (dst_doc):
-            return sphinx.util.nodes.make_refnode(builder, src_doc, dst_doc, nodes.make_id(target), cont_node, 'records.config')
+        if dst_doc:
+            return sphinx.util.nodes.make_refnode(builder, src_doc, dst_doc, nodes.make_id(target), cont_node, 'records.yaml')
 
     # Python 2/3 compat - iteritems is 2, items is 3
     # Although perhaps the lists are small enough items could be used in Python 2.
@@ -380,6 +455,7 @@ class TrafficServerDomain(Domain):
             for var, doc in self.data['stat'].iteritems():
                 yield var, var, 'stat', doc, var, 1
     except AttributeError:
+
         def get_objects(self):
             for var, doc in self.data['cv'].items():
                 yield var, var, 'cv', doc, var, 1
@@ -388,18 +464,24 @@ class TrafficServerDomain(Domain):
 
 
 # get the branch this documentation is building for in X.X.x form
-REPO_ROOT = os.path.join(os.path.dirname(os.path.dirname(
-    os.environ['DOCUTILSCONFIG'])))
-CONFIGURE_AC = os.path.join(REPO_ROOT, 'configure.ac')
-with open(CONFIGURE_AC, 'r') as f:
+REPO_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.environ['DOCUTILSCONFIG'])))
+with open('../CMakeLists.txt') as f:
     contents = f.read()
-    match = re.compile(r'm4_define\(\[TS_VERSION_S],\[(.*?)]\)').search(contents)
-    autoconf_version = '.'.join(match.group(1).split('.', 2)[:2] + ['x'])
+match = re.search(r'project\(ats VERSION ([0-9\.]+)', contents)
 
-# get the current branch the local repository is on
-REPO_GIT_DIR = os.path.join(REPO_ROOT, ".git")
-git_branch = subprocess.check_output(['git', '--git-dir', REPO_GIT_DIR,
-                                      'rev-parse', '--abbrev-ref', 'HEAD'])
+if match:
+    release = '.'.join(match.group(1).split('.', 2)[:2] + ['x'])
+else:
+    release = 'x.y.z'
+
+# Get the current branch the local repository is on.
+# Run git from the repository root to work with both normal repos and worktrees.
+try:
+    git_branch = subprocess.check_output(
+        ['git', '-C', REPO_ROOT, 'rev-parse', '--abbrev-ref', 'HEAD'], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+except (subprocess.CalledProcessError, FileNotFoundError):
+    git_branch = 'master'
 
 
 def make_github_link(name, rawtext, text, lineno, inliner, options=None, content=None):
@@ -423,15 +505,13 @@ def make_github_link(name, rawtext, text, lineno, inliner, options=None, content
     if content is None:
         content = []
     url = 'https://github.com/apache/trafficserver/blob/{}/{}'
-    ref = autoconf_version if autoconf_version == git_branch else 'master'
+    ref = release if release == git_branch else 'master'
     node = nodes.reference(rawtext, text, refuri=url.format(ref, text), **options)
     return [node], []
 
 
 def setup(app):
-    app.add_crossref_type('configfile', 'file',
-                          objname='Configuration file',
-                          indextemplate='pair: %s; Configuration files')
+    app.add_crossref_type('configfile', 'file', objname='Configuration file', indextemplate='pair: %s; Configuration files')
 
     # Very ugly, but as of Sphinx 1.8 it must be done. There is an `override` option to add_crossref_type
     # but it only applies to the directive, not the role (`file` in this case). If this isn't cleared
@@ -440,9 +520,7 @@ def setup(app):
     # names are disjoint sets.
     del app.registry.domain_roles['std']['file']
 
-    app.add_crossref_type('logfile', 'file',
-                          objname='Log file',
-                          indextemplate='pair: %s; Log files')
+    app.add_crossref_type('logfile', 'file', objname='Log file', indextemplate='pair: %s; Log files')
 
     rst.roles.register_generic_role('arg', nodes.emphasis)
     rst.roles.register_generic_role('const', nodes.literal)

@@ -1,0 +1,111 @@
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+"""Small utilities shared by direct and procedural Uranium tests."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from pathlib import Path
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+
+def python_environment_executable(name: str) -> str:
+    """Resolve a console script installed beside the running interpreter.
+
+    :param name: Console-script executable name.
+    :return: Absolute path when installed in the active Python environment,
+        otherwise the original name for ordinary ``PATH`` resolution.
+    """
+
+    return shutil.which(name, path=str(Path(sys.executable).parent)) or name
+
+
+def loopback_addresses(ports: Iterable[int]) -> str:
+    """Format loopback listener addresses for Proxy Verifier.
+
+    :param ports: TCP port numbers to format.
+    """
+
+    return ",".join(f"127.0.0.1:{port}" for port in ports)
+
+
+def tcp_open(port: int, address: str = "127.0.0.1") -> bool:
+    """Return whether a TCP listener accepts a short probe connection.
+
+    :param port: TCP port number to probe.
+    :param address: IP address or hostname to probe.
+    """
+
+    try:
+        with socket.create_connection((address, port), timeout=0.1):
+            return True
+    except OSError:
+        return False
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    """Convert a dotted version string to comparable integer components.
+
+    :param value: Version string containing numeric components.
+    """
+
+    match = re.search(r"\d+(?:\.\d+)+", value)
+    return tuple(int(part) for part in match.group(0).split(".")) if match else ()
+
+
+def go_mod_version(go_mod: Path) -> tuple[int, ...]:
+    """Return the minimum Go version from a module's ``go`` directive.
+
+    :param go_mod: Path to the module's go.mod file.
+    :raises OSError: If the file cannot be read.
+    :raises ValueError: If the file has no ``go`` directive with a version.
+    """
+
+    match = re.search(r"^go[ \t]+(\S+)", go_mod.read_text(), re.MULTILINE)
+    version = version_tuple(match.group(1)) if match else ()
+    if not version:
+        raise ValueError(f"{go_mod} has no go directive with a version")
+    return version
+
+
+def go_toolchain_skip_reason(go_mod: Path) -> str | None:
+    """Return why the local Go toolchain cannot build a module, or None if it can.
+
+    The probe runs ``go version`` with ``GOTOOLCHAIN=local``, the setting the
+    Go test clients build with, so a toolchain switch in the environment
+    cannot report a newer Go than the build will use.
+
+    :param go_mod: Path to the module's go.mod file.
+    :raises ValueError: If go.mod has no ``go`` directive, or if ``go version``
+        prints no version number.
+    """
+
+    required = go_mod_version(go_mod)
+    needed = f"Go {'.'.join(map(str, required))} or newer is required by {go_mod.parent.name}/go.mod"
+    if shutil.which("go") is None:
+        return f"{needed}; go is not on PATH"
+    output = subprocess.check_output(("go", "version"), text=True, env={**os.environ, "GOTOOLCHAIN": "local"})
+    installed = version_tuple(output)
+    if not installed:
+        raise ValueError(f"cannot read a Go version from {output.strip()!r}")
+    if installed < required:
+        return f"{needed}; found Go {'.'.join(map(str, installed))}"
+    return None
